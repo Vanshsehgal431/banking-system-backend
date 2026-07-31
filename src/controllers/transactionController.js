@@ -108,11 +108,39 @@ export async function transaction(req, res, next) {
   }
 }
 
-// export async function transactions(req, res, next) {
-//   try {
-//     const details = req.body;
+export async function transactions(req, res, next) {
+  try {
+    const details = req.body;
 
-//     const account_number = details.account_number;
+    const account_number = details.account_number;
 
-//   }
-// }
+    if (!account_number) {
+      const error = new Error(
+        "Account number must be available for transactions",
+      );
+      res.status(400);
+      return next(error);
+    }
+
+    if (typeof account_number !== "string") {
+      res.status(400);
+      return next(new Error("Sender account number must be a string"));
+    }
+
+    const [rows] = await pool.execute(
+      "SELECT * FROM transactions WHERE sender_account_number = ? OR receiver_account_number = ?",
+      [account_number, account_number],
+    );
+
+    if (rows.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "No transactions related to this account",
+      });
+    }
+
+    return res.status(200).json({ success: true, data: rows });
+  } catch (error) {
+    next(error);
+  }
+}
