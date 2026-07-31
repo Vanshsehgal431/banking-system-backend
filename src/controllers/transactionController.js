@@ -67,8 +67,14 @@ export async function transaction(req, res, next) {
       // 5. Commit and finish successfully
 
       await connection.execute(
-        "INSERT INTO transactions (sender_account_number, receiver_account_number, amount, status) VALUES(?,?,?,?)",
-        [sender_account_number, receiver_account_number, amount, "SUCCESS"],
+        "INSERT INTO transactions (sender_account_number, receiver_account_number, amount, status, transaction_type) VALUES(?,?,?,?,?)",
+        [
+          sender_account_number,
+          receiver_account_number,
+          amount,
+          "SUCCESS",
+          "TRANSFER",
+        ],
       );
 
       await connection.commit();
@@ -95,9 +101,15 @@ export async function transaction(req, res, next) {
         continue;
       }
       try {
-        await pool.execute(
-          "INSERT INTO transactions (sender_account_number, receiver_account_number, amount, status) VALUES(?,?,?,?)",
-          [sender_account_number, receiver_account_number, amount, "FAILURE"],
+        await connection.execute(
+          "INSERT INTO transactions (sender_account_number, receiver_account_number, amount, status, transaction_type) VALUES(?,?,?,?,?)",
+          [
+            sender_account_number,
+            receiver_account_number,
+            amount,
+            "FAILURE",
+            "TRANSFER",
+          ],
         );
       } catch (logError) {
         console.error("Failed to write system failure log:", logError.message);
@@ -128,7 +140,7 @@ export async function transactions(req, res, next) {
     }
 
     const [rows] = await pool.execute(
-      "SELECT * FROM transactions WHERE sender_account_number = ? OR receiver_account_number = ?",
+      "SELECT * FROM transactions WHERE sender_account_number = ? OR receiver_account_number = ? ORDER BY created_at",
       [account_number, account_number],
     );
 
@@ -141,6 +153,89 @@ export async function transactions(req, res, next) {
 
     return res.status(200).json({ success: true, data: rows });
   } catch (error) {
+    next(error);
+  }
+}
+
+export async function withdraw(req, res, next) {
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+    const details = req.body;
+
+    const account_number = details.account_number;
+    const amount = details.amount;
+
+    if (!account_number) {
+      await connection.rollback();
+      connection.release();
+      const error = new Error(
+        "Account number must be available for transactions",
+      );
+      res.status(400);
+      return next(error);
+    }
+
+    if (typeof account_number !== "string") {
+      await connection.rollback();
+      connection.release();
+      res.status(400);
+      return next(new Error("Sender account number must be a string"));
+    }
+
+    if (amount <= 0) {
+      await connection.rollback();
+      connection.release();
+      const error = new Error("Amount must be positive");
+      res.status(400);
+      return next(error);
+    }
+
+    const [rows] = await connection.execute(
+      "SELECT balance FROM accounts WHERE account_number = ? FOR UPDATE",
+      [account_number],
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      connection.release();
+      const error = new Error("No account found");
+      res.status(400);
+      return next(error);
+    }
+
+    const balance = rows[0].balance;
+
+    if (balance < amount) {
+      await connection.rollback();
+      connection.release();
+      const error = new Error("Insufficient balance.");
+      res.status(400);
+      return next(error);
+    }
+
+    await connection.execute(
+      "UPDATE accounts SET balance = ? WHERE account_number = ?",
+      [balance - amount, account_number],
+    );
+
+    await connection.execute(
+      "INSERT INTO transactions (sender_account_number, receiver_account_number, amount, status, transaction_type) VALUES(?,?,?,?,?)",
+      [account_number, null, -1 * amount, "SUCCESS", "WITHDRAW"],
+    );
+
+    await connection.commit();
+    connection.release();
+
+    return res.status(200).json({
+      success: true,
+      message: "Transaction successful",
+      data: { account_number, amount },
+    });
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
     next(error);
   }
 }
