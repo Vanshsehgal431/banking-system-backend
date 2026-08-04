@@ -1,6 +1,6 @@
 import jwt from "jsonwebtoken";
 
-const ACCESS_TOKEN_SECRET = process.env.JWT_ACCESS_TOKEN;
+const ACCESS_TOKEN_SECRET = process.env.JWT_SECRET;
 
 export async function authenticateUser(req, res, next) {
   try {

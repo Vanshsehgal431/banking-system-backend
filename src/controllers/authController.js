@@ -5,7 +5,7 @@
 
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import { pool } from "../config/database.js";
+import pool from "../config/database.js";
 import { generateAccessToken, generateRefreshToken } from "../config/jwt.js";
 
 const SALT_ROUNDS = 10;
@@ -121,17 +121,29 @@ export async function handleRefreshToken(req, res, next) {
   try {
     const incomingRefreshToken = req.cookies.refreshToken;
 
-    if (!incomingRefreshToken)
-      return res.status(401).json({ message: "Refresh token missing" });
+    if (!incomingRefreshToken) {
+      const error = new Error("Refresh token missing.");
+      error.statusCode = 401;
+      return next(error);
+    }
 
-    const decoded = jwt.verify(
-      incomingRefreshToken,
-      process.env.JWT_REFRESH_TOKEN,
-    );
+    // Verify JWT
+    let decoded;
+    try {
+      decoded = jwt.verify(
+        incomingRefreshToken,
+        process.env.JWT_REFRESH_SECRET,
+      );
+    } catch (err) {
+      const error = new Error("Invalid or expired refresh token.");
+      error.statusCode = 403;
+      return next(error);
+    }
 
+    // Find the EXACT refresh token
     const [rows] = await pool.execute(
-      "SELECT * FROM refresh_token WHERE user_id = ?",
-      [decoded.id],
+      "SELECT * FROM refresh_token WHERE token_string = ?",
+      [incomingRefreshToken],
     );
 
     if (rows.length === 0) {
@@ -142,6 +154,14 @@ export async function handleRefreshToken(req, res, next) {
 
     const storedToken = rows[0];
 
+    // Extra safety check
+    if (storedToken.user_id !== decoded.id) {
+      const error = new Error("Refresh token does not belong to this user.");
+      error.statusCode = 403;
+      return next(error);
+    }
+
+    // Refresh token reuse detected
     if (storedToken.is_used) {
       await pool.execute("DELETE FROM refresh_token WHERE user_id = ?", [
         storedToken.user_id,
@@ -154,19 +174,23 @@ export async function handleRefreshToken(req, res, next) {
       return next(error);
     }
 
+    // Mark current refresh token as used
     await pool.execute("UPDATE refresh_token SET is_used = TRUE WHERE id = ?", [
       storedToken.id,
     ]);
 
-    const payload = { id: storedToken.user_id };
+    const payload = {
+      id: storedToken.user_id,
+    };
 
     const newAccessToken = generateAccessToken(payload);
     const newRefreshToken = generateRefreshToken(payload);
 
+    // Store new refresh token
     await pool.execute(
       `INSERT INTO refresh_token
-        (user_id, token_string, parent_token_id)
-       VALUES (?, ?, ?)`,
+      (user_id, token_string, parent_token_id)
+      VALUES (?, ?, ?)`,
       [storedToken.user_id, newRefreshToken, storedToken.id],
     );
 
@@ -192,7 +216,6 @@ export async function handleRefreshToken(req, res, next) {
     next(error);
   }
 }
-
 export async function logout(req, res, next) {
   try {
     const incomingRefreshToken = req.cookies.refreshToken;

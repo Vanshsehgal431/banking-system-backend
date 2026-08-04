@@ -1,11 +1,13 @@
-import pool from "../config/database";
+import pool from "../config/database.js";
 
 export async function getUser(req, res, next) {
   try {
     const user = req.user;
 
-    const userDetails = await pool.execute(
-      "SELECT first_name, last_name, email, phone, role FROM users WHERE user_id = ?",
+    const [rows] = await pool.execute(
+      `SELECT first_name, last_name, email, phone, role
+       FROM users
+       WHERE id = ?`,
       [user.id],
     );
 
@@ -17,7 +19,7 @@ export async function getUser(req, res, next) {
 
     const userDetails = rows[0];
 
-    res.status(200).json({
+    return res.status(200).json({
       first_name: userDetails.first_name,
       last_name: userDetails.last_name,
       email: userDetails.email,

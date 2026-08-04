@@ -1,4 +1,4 @@
-import pool from "../config/database";
+import pool from "../config/database.js";
 
 // Helper function to sleep/wait between retries
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -9,7 +9,6 @@ export async function transaction(req, res, next) {
   const MAX_RETRIES = 3;
   let attempts = 0;
 
-  // Loop to allow automatic retries if a deadlock happens
   while (attempts < MAX_RETRIES) {
     attempts++;
     const connection = await pool.getConnection();
@@ -17,35 +16,50 @@ export async function transaction(req, res, next) {
     try {
       await connection.beginTransaction();
 
-      let [senderRows] = await connection.execute(
-        "SELECT balance FROM accounts WHERE account_number = ? FOR UPDATE",
-        [sender_account_number],
+      // Verify sender account belongs to authenticated user
+      const [senderRows] = await connection.execute(
+        `SELECT balance
+         FROM accounts
+         WHERE account_number = ? AND user_id = ?
+         FOR UPDATE`,
+        [sender_account_number, req.user.id],
       );
 
       if (senderRows.length === 0) {
         await connection.rollback();
         connection.release();
+
         res.status(404);
-        return next(new Error("No sender account found"));
+        return next(
+          new Error("Sender account not found or does not belong to you"),
+        );
       }
+
       const sender_balance = Number(senderRows[0].balance);
 
-      let [receiverRows] = await connection.execute(
-        "SELECT balance FROM accounts WHERE account_number = ? FOR UPDATE",
+      // Lock receiver account
+      const [receiverRows] = await connection.execute(
+        `SELECT balance
+         FROM accounts
+         WHERE account_number = ?
+         FOR UPDATE`,
         [receiver_account_number],
       );
 
       if (receiverRows.length === 0) {
         await connection.rollback();
         connection.release();
+
         res.status(404);
         return next(new Error("No receiver account found"));
       }
+
       const receiver_balance = Number(receiverRows[0].balance);
 
       if (sender_balance < amount) {
         await connection.rollback();
         connection.release();
+
         res.status(400);
         return next(
           new Error(
@@ -64,10 +78,10 @@ export async function transaction(req, res, next) {
         [receiver_balance + amount, receiver_account_number],
       );
 
-      // 5. Commit and finish successfully
-
       await connection.execute(
-        "INSERT INTO transactions (sender_account_number, receiver_account_number, amount, status, transaction_type) VALUES(?,?,?,?,?)",
+        `INSERT INTO transactions
+        (sender_account_number, receiver_account_number, amount, status, transaction_type)
+        VALUES (?, ?, ?, ?, ?)`,
         [
           sender_account_number,
           receiver_account_number,
@@ -83,13 +97,16 @@ export async function transaction(req, res, next) {
       return res.status(200).json({
         success: true,
         message: "Transaction successful",
-        data: { sender_account_number, receiver_account_number, amount },
+        data: {
+          sender_account_number,
+          receiver_account_number,
+          amount,
+        },
       });
     } catch (error) {
       await connection.rollback();
       connection.release();
 
-      // Check if the error is a MySQL Deadlock (Error Code: 1213 / 'ER_LOCK_DEADLOCK')
       const isDeadlock =
         error.errno === 1213 || error.code === "ER_LOCK_DEADLOCK";
 
@@ -100,14 +117,17 @@ export async function transaction(req, res, next) {
         await sleep(50);
         continue;
       }
+
       try {
-        await connection.execute(
-          "INSERT INTO transactions (sender_account_number, receiver_account_number, amount, status, transaction_type) VALUES(?,?,?,?,?)",
+        await pool.execute(
+          `INSERT INTO transactions
+          (sender_account_number, receiver_account_number, amount, status, transaction_type)
+          VALUES (?, ?, ?, ?, ?)`,
           [
             sender_account_number,
             receiver_account_number,
             amount,
-            "FAILURE",
+            "FAILED",
             "TRANSFER",
           ],
         );
@@ -122,25 +142,37 @@ export async function transaction(req, res, next) {
 
 export async function transactions(req, res, next) {
   try {
-    const details = req.body;
-
-    const account_number = details.account_number;
+    const { account_number } = req.body;
 
     if (!account_number) {
-      const error = new Error(
-        "Account number must be available for transactions",
-      );
       res.status(400);
-      return next(error);
+      return next(
+        new Error("Account number must be available for transactions"),
+      );
     }
 
     if (typeof account_number !== "string") {
       res.status(400);
-      return next(new Error("Sender account number must be a string"));
+      return next(new Error("Account number must be a string"));
+    }
+
+    // Verify ownership
+    const [accountRows] = await pool.execute(
+      "SELECT id FROM accounts WHERE account_number = ? AND user_id = ?",
+      [account_number, req.user.id],
+    );
+
+    if (accountRows.length === 0) {
+      res.status(403);
+      return next(new Error("You are not authorized to access this account"));
     }
 
     const [rows] = await pool.execute(
-      "SELECT * FROM transactions WHERE sender_account_number = ? OR receiver_account_number = ? ORDER BY created_at",
+      `SELECT *
+       FROM transactions
+       WHERE sender_account_number = ?
+          OR receiver_account_number = ?
+       ORDER BY created_at DESC`,
       [account_number, account_number],
     );
 
@@ -151,7 +183,10 @@ export async function transactions(req, res, next) {
       });
     }
 
-    return res.status(200).json({ success: true, data: rows });
+    return res.status(200).json({
+      success: true,
+      data: rows,
+    });
   } catch (error) {
     next(error);
   }
@@ -162,57 +197,60 @@ export async function withdraw(req, res, next) {
 
   try {
     await connection.beginTransaction();
-    const details = req.body;
 
-    const account_number = details.account_number;
-    const amount = details.amount;
+    const { account_number, amount } = req.body;
 
     if (!account_number) {
       await connection.rollback();
       connection.release();
-      const error = new Error(
-        "Account number must be available for transactions",
-      );
+
       res.status(400);
-      return next(error);
+      return next(
+        new Error("Account number must be available for transactions"),
+      );
     }
 
     if (typeof account_number !== "string") {
       await connection.rollback();
       connection.release();
+
       res.status(400);
-      return next(new Error("Sender account number must be a string"));
+      return next(new Error("Account number must be a string"));
     }
 
     if (amount <= 0) {
       await connection.rollback();
       connection.release();
-      const error = new Error("Amount must be positive");
+
       res.status(400);
-      return next(error);
+      return next(new Error("Amount must be positive"));
     }
 
+    // Verify ownership
     const [rows] = await connection.execute(
-      "SELECT balance FROM accounts WHERE account_number = ? FOR UPDATE",
-      [account_number],
+      `SELECT balance
+       FROM accounts
+       WHERE account_number = ? AND user_id = ?
+       FOR UPDATE`,
+      [account_number, req.user.id],
     );
 
     if (rows.length === 0) {
       await connection.rollback();
       connection.release();
-      const error = new Error("No account found");
-      res.status(400);
-      return next(error);
+
+      res.status(404);
+      return next(new Error("Account not found or does not belong to you"));
     }
 
-    const balance = rows[0].balance;
+    const balance = Number(rows[0].balance);
 
     if (balance < amount) {
       await connection.rollback();
       connection.release();
-      const error = new Error("Insufficient balance.");
+
       res.status(400);
-      return next(error);
+      return next(new Error("Insufficient balance."));
     }
 
     await connection.execute(
@@ -221,8 +259,10 @@ export async function withdraw(req, res, next) {
     );
 
     await connection.execute(
-      "INSERT INTO transactions (sender_account_number, receiver_account_number, amount, status, transaction_type) VALUES(?,?,?,?,?)",
-      [account_number, null, -1 * amount, "SUCCESS", "WITHDRAW"],
+      `INSERT INTO transactions
+      (sender_account_number, receiver_account_number, amount, status, transaction_type)
+      VALUES (?, ?, ?, ?, ?)`,
+      [account_number, null, -amount, "SUCCESS", "WITHDRAW"],
     );
 
     await connection.commit();
@@ -231,7 +271,93 @@ export async function withdraw(req, res, next) {
     return res.status(200).json({
       success: true,
       message: "Transaction successful",
-      data: { account_number, amount },
+      data: {
+        account_number,
+        amount,
+      },
+    });
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    next(error);
+  }
+}
+
+export async function deposit(req, res, next) {
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const { account_number, amount } = req.body;
+
+    if (!account_number) {
+      await connection.rollback();
+      connection.release();
+
+      res.status(400);
+      return next(
+        new Error("Account number must be available for transactions"),
+      );
+    }
+
+    if (typeof account_number !== "string") {
+      await connection.rollback();
+      connection.release();
+
+      res.status(400);
+      return next(new Error("Account number must be a string"));
+    }
+
+    if (amount <= 0) {
+      await connection.rollback();
+      connection.release();
+
+      res.status(400);
+      return next(new Error("Amount must be positive"));
+    }
+
+    // Verify ownership
+    const [rows] = await connection.execute(
+      `SELECT balance
+       FROM accounts
+       WHERE account_number = ? AND user_id = ?
+       FOR UPDATE`,
+      [account_number, req.user.id],
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      connection.release();
+
+      res.status(404);
+      return next(new Error("Account not found or does not belong to you"));
+    }
+
+    const balance = Number(rows[0].balance);
+
+    await connection.execute(
+      "UPDATE accounts SET balance = ? WHERE account_number = ?",
+      [balance + amount, account_number],
+    );
+
+    await connection.execute(
+      `INSERT INTO transactions
+      (sender_account_number, receiver_account_number, amount, status, transaction_type)
+      VALUES (?, ?, ?, ?, ?)`,
+      [null, account_number, amount, "SUCCESS", "DEPOSIT"],
+    );
+
+    await connection.commit();
+    connection.release();
+
+    return res.status(200).json({
+      success: true,
+      message: "Deposit successful",
+      data: {
+        account_number,
+        amount,
+      },
     });
   } catch (error) {
     await connection.rollback();
